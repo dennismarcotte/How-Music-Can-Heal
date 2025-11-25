@@ -1,0 +1,301 @@
+
+
+Save as master.sh and chmod +x master.sh.
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========================
+# Configurable parameters
+# ========================
+EPUB_DIR="epub"                       # root of EPUB tree
+OEBPS_DIR="$EPUB_DIR/OEBPS"
+PRINT_HTML="$OEBPS_DIR/index.xhtml"   # main XHTML to render to PDF
+TEXT_OUT="build/book.txt"             # plain text output
+PDF_OUT="build/book.pdf"              # PDF output
+EPUB_OUT="build/book.epub"            # final EPUB
+BUILD_DIR="build"
+
+# Optional: include git commit hash in logs and as meta stamp
+STAMP="$(git rev-parse --short HEAD 2>/dev/null || echo 'no-git')-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# ========================
+# Helpers
+# ========================
+log() { printf "[master.sh] %s\n" "$*"; }
+warn() { printf "[master.sh][WARN] %s\n" "$*" >&2; }
+die() { printf "[master.sh][ERROR] %s\n" "$*" >&2; exit 1; }
+
+need_file() {
+  [[ -f "$1" ]] || die "Missing file: $1"
+}
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_build_dir() {
+  mkdir -p "$BUILD_DIR"
+}
+
+# Detect Chrome/Chromium executable
+detect_chrome() {
+  if [[ -n "${CHROME_PATH:-}" && -x "$CHROME_PATH" ]]; then
+    echo "$CHROME_PATH"; return 0
+  fi
+  local candidates=(
+    "google-chrome"
+    "google-chrome-stable"
+    "chromium"
+    "chromium-browser"
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    "/Applications/Chromium.app/Contents/MacOS/Chromium"
+  )
+  for c in "${candidates[@]}"; do
+    if command -v "$c" >/dev/null 2>&1; then echo "$c"; return 0; fi
+    [[ -x "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# Simple "is newer" check: if any source is newer than target
+is_outdated() {
+  local target="$1"; shift
+  [[ ! -e "$target" ]] && return 0
+  local src
+  for src in "$@"; do
+    [[ "$src" -nt "$target" ]] && return 0
+  done
+  return 1
+}
+
+# Gather XHTMLs for text render and mtime checks
+gather_xhtml() {
+  find "$OEBPS_DIR" -type f \( -name "*.xhtml" -o -name "*.html" \) | sort
+}
+
+# ========================
+# Step 1: Validate inputs
+# ========================
+need_file "$EPUB_DIR/mimetype"
+need_file "$EPUB_DIR/META-INF/container.xml"
+need_file "$OEBPS_DIR/content.opf"
+need_file "$PRINT_HTML"
+
+ensure_build_dir
+
+log "Build stamp: $STAMP"
+
+# ================================
+# Step 2: Regenerate plain text
+# ================================
+generate_plaintext() {
+  local xhtml_list
+  # By default, concatenate all XHTMLs in spine order if we can parse OPF; else fallback to directory sort.
+  local ordered_list=()
+  if cmd_exists xmllint; then
+    # Extract hrefs from spine via manifest idrefs; robust enough for common OPFs.
+    local tmp_manifest="$BUILD_DIR/.manifest.$$"
+    local tmp_spine="$BUILD_DIR/.spine.$$"
+    xmllint --xpath "//*[local-name()='manifest']/*[local-name()='item']/@id | /*" "$OEBPS_DIR/content.opf" >"$tmp_manifest" 2>/dev/null || true
+    xmllint --xpath "//*[local-name()='spine']/*[local-name()='itemref']/@idref | /*" "$OEBPS_DIR/content.opf" >"$tmp_spine" 2>/dev/null || true
+    # Build id->href map
+    declare -A HREFS=()
+    while read -r line; do
+      # line like: id="chap1" href="chapter1.xhtml"
+      if [[ "$line" =~ id=\"([^\"]+)\"[^\>]*href=\"([^\"]+)\" ]]; then
+        HREFS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+      fi
+    done < <(grep -oE 'id="[^"]+"[^>]*href="[^"]+"' "$OEBPS_DIR/content.opf" || true)
+
+    while read -r idref; do
+      if [[ "$idref" =~ idref=\"([^\"]+)\" ]]; then
+        local id="${BASH_REMATCH[1]}"
+        local href="${HREFS[$id]:-}"
+        if [[ -n "$href" ]]; then
+          local p="$OEBPS_DIR/$href"
+          [[ -f "$p" ]] && ordered_list+=("$p")
+        fi
+      fi
+    done < <(grep -oE 'idref="[^"]+"' "$OEBPS_DIR/content.opf" || true)
+
+    # Cleanup temp vars (files not created if grep path used)
+    :
+  fi
+
+  if [[ ${#ordered_list[@]} -eq 0 ]]; then
+    mapfile -t ordered_list < <(gather_xhtml)
+  fi
+
+  # Choose best text extractor
+  local extractor=""
+  if cmd_exists pandoc; then extractor="pandoc"
+  elif cmd_exists lynx; then extractor="lynx"
+  elif cmd_exists w3m; then extractor="w3m"
+  elif cmd_exists html2text; then extractor="html2text"
+  else
+    warn "No text extractor found (pandoc/lynx/w3m/html2text). Skipping plain text generation."
+    return 0
+  fi
+
+  # Determine if we need to rerun
+  if is_outdated "$TEXT_OUT" "${ordered_list[@]}"; then
+    log "Generating plain text via $extractor -> $TEXT_OUT"
+    mkdir -p "$(dirname "$TEXT_OUT")"
+    : > "$TEXT_OUT"
+    for file in "${ordered_list[@]}"; do
+      case "$extractor" in
+        pandoc)
+          pandoc -f html -t plain --wrap=none "$file" >> "$TEXT_OUT"
+          printf "\n\n" >> "$TEXT_OUT"
+          ;;
+        lynx)
+          lynx -dump -nolist "file://$(cd "$(dirname "$file")"; pwd)/$(basename "$file")" >> "$TEXT_OUT"
+          printf "\n\n" >> "$TEXT_OUT"
+          ;;
+        w3m)
+          w3m -dump "$file" >> "$TEXT_OUT"
+          printf "\n\n" >> "$TEXT_OUT"
+          ;;
+        html2text)
+          html2text -nobs "$file" >> "$TEXT_OUT"
+          printf "\n\n" >> "$TEXT_OUT"
+          ;;
+      esac
+    done
+  else
+    log "Plain text up-to-date: $TEXT_OUT"
+  fi
+}
+
+# ========================================
+# Step 3: Export PDF via Chrome/wkhtmltopdf
+# ========================================
+render_pdf() {
+  # Check if rendering needed
+  local inputs=("$PRINT_HTML")
+  while IFS= read -r -d '' css; do inputs+=("$css"); done < <(find "$OEBPS_DIR" -type f -name "*.css" -print0)
+  while IFS= read -r -d '' img; do inputs+=("$img"); done < <(find "$OEBPS_DIR" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.svg" \) -print0)
+
+  if ! is_outdated "$PDF_OUT" "${inputs[@]}"; then
+    log "PDF up-to-date: $PDF_OUT"
+    return 0
+  fi
+  mkdir -p "$(dirname "$PDF_OUT")"
+
+  # Chrome path
+  local CHROME_BIN
+  if CHROME_BIN="$(detect_chrome)"; then
+    log "Rendering PDF with Chrome: $CHROME_BIN"
+    # Notes:
+    # --print-to-pdf-no-header adds no header/footer; adjust margins via CSS @page
+    # Use file:// URL. On macOS/Linux, space-safe with absolute path.
+    local abs_html
+    abs_html="$(cd "$(dirname "$PRINT_HTML")"; pwd)/$(basename "$PRINT_HTML")"
+    "$CHROME_BIN" \
+      --headless \
+      --disable-gpu \
+      --no-sandbox \
+      --run-all-compositor-stages-before-draw \
+      --print-to-pdf="$PDF_OUT" \
+      --print-to-pdf-no-header \
+      "file://$abs_html" >/dev/null 2>&1 || warn "Chrome PDF export failed; will try wkhtmltopdf if available."
+  else
+    warn "Chrome/Chromium not found."
+  fi
+
+  if [[ ! -s "$PDF_OUT" ]]; then
+    if cmd_exists wkhtmltopdf; then
+      log "Rendering PDF with wkhtmltopdf"
+      wkhtmltopdf --enable-local-file-access "$PRINT_HTML" "$PDF_OUT" || warn "wkhtmltopdf failed."
+    fi
+  fi
+
+  if [[ -s "$PDF_OUT" ]]; then
+    log "PDF generated: $PDF_OUT"
+  else
+    warn "PDF not generated. Skipping."
+  fi
+}
+
+# ====================================
+# Step 4: Zip EPUB with correct flags
+# ====================================
+zip_epub() {
+  need_file "$EPUB_DIR/mimetype"
+  need_file "$EPUB_DIR/META-INF/container.xml"
+  need_file "$OEBPS_DIR/content.opf"
+
+  # Determine if rebuild needed (any source newer than EPUB)
+  local sources
+  mapfile -t sources < <(find "$EPUB_DIR" -type f | sort)
+  if ! is_outdated "$EPUB_OUT" "${sources[@]}"; then
+    log "EPUB up-to-date: $EPUB_OUT"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$EPUB_OUT")"
+  local tmp_epub="$EPUB_OUT.tmp"
+  rm -f "$tmp_epub"
+
+  # 1) Store mimetype first, no compression
+  (
+    cd "$EPUB_DIR"
+    # Use -X to omit extra file attributes for reproducibility, -q quiet
+    zip -X0 -q "$PWD/../$tmp_epub" mimetype
+    # 2) Add the rest with compression
+    zip -X9 -q -r "$PWD/../$tmp_epub" META-INF OEBPS -x "*/.*" -x "mimetype"
+  ) || die "Failed to zip EPUB"
+
+  mv -f "$tmp_epub" "$EPUB_OUT"
+  log "EPUB built: $EPUB_OUT"
+
+  if cmd_exists epubcheck; then
+    log "Running epubcheck..."
+    if epubcheck "$EPUB_OUT"; then
+      log "epubcheck passed."
+    else
+      warn "epubcheck reported issues."
+    fi
+  else
+    warn "epubcheck not found; skipping validation."
+  fi
+}
+
+# ========================
+# Run the steps
+# ========================
+generate_plaintext
+render_pdf
+zip_epub
+
+log "Done."
+exit 0
+Notes and tweaks:
+* Change PRINT_HTML if your print entry file differs (e.g., OEBPS/print.html).
+* For large images or webfonts, Chrome may need more flags; you can add: --virtual-time-budget=30000 --disable-dev-shm-usage
+* If your CSS relies on print media, ensure your stylesheet has @media print rules or set Emulate CSS media to print using puppeteer if you switch to a Node wrapper.
+Optional cross-platform Chrome detection via Node.js (Windows-friendly):
+* Create tools/chrome-path.js with:
+#!/usr/bin/env node
+const { existsSync } = require('fs');
+const { execSync } = require('child_process');
+
+function tryWhich(cmd) {
+  try { return execSync(process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`, { stdio: ['ignore','pipe','ignore'] }).toString().split(/\r?\n/)[0].trim(); } catch { return ''; }
+}
+
+const candidates = [
+  process.env.CHROME_PATH || '',
+  tryWhich('chrome'),
+  tryWhich('chrome.exe'),
+  tryWhich('google-chrome'),
+  tryWhich('google-chrome-stable'),
+  tryWhich('chromium'),
+  tryWhich('chromium-browser'),
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
+].filter(Boolean);
+
+for (const c of candidates) {
+  if (c && existsSync(c)) { console.log(c); process.exit(0); }
+}
+process.exit(1);
+
